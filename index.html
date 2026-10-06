@@ -939,14 +939,131 @@ function openReceipt(t){
 function openReceiptById(id){
   const t=state.transactions.find(x=>x.id===id);if(t)openReceipt(t);
 }
-function preparePrint(size){
+/* =========================
+   RAWBT / ESC-POS PRINT
+   Android + RawBT: rawbt:base64,<ESC/POS bytes>
+   Di desktop, fallback tetap memakai browser print dialog.
+========================= */
+function rawBtAndroid(){
+  return /Android/i.test(navigator.userAgent);
+}
+function escposBytes(text){
+  return new TextEncoder().encode(text);
+}
+function bytesToBase64(bytes){
+  let binary="";
+  const chunk=0x8000;
+  for(let i=0;i<bytes.length;i+=chunk){
+    binary+=String.fromCharCode(...bytes.subarray(i,Math.min(i+chunk,bytes.length)));
+  }
+  return btoa(binary);
+}
+function escCmd(...bytes){ return new Uint8Array(bytes); }
+function concatBytes(...parts){
+  const total=parts.reduce((n,p)=>n+p.length,0);
+  const out=new Uint8Array(total); let pos=0;
+  parts.forEach(p=>{out.set(p,pos);pos+=p.length;});
+  return out;
+}
+function textBytes(text){ return escposBytes(String(text)); }
+function center(text){ return `\x1b\x61\x01${text}\n`; }
+function left(){ return "\x1b\x61\x00"; }
+function bold(on=true){ return on?"\x1b\x45\x01":"\x1b\x45\x00"; }
+function sizeNormal(){ return "\x1d\x21\x00"; }
+function sizeTitle(){ return "\x1d\x21\x11"; }
+function line(ch,w){ return String(ch).repeat(w)+"\n"; }
+function fitText(text,max){
+  text=String(text||"");
+  return text.length>max ? text.slice(0,Math.max(0,max-1))+"..." : text;
+}
+function rowLR(leftText,rightText,width){
+  leftText=String(leftText||""); rightText=String(rightText||"");
+  if(rightText.length>=width) return fitText(leftText,width)+"\n"+fitText(rightText,width)+"\n";
+  const maxLeft=width-rightText.length-1;
+  return fitText(leftText,maxLeft)+" ".repeat(Math.max(1,width-fitText(leftText,maxLeft).length-rightText.length))+rightText+"\n";
+}
+function wrapLines(text,width){
+  const words=String(text||"").split(/\s+/); const out=[]; let cur="";
+  words.forEach(w=>{
+    if(!w)return;
+    if(!cur)cur=w;
+    else if((cur+" "+w).length<=width)cur+=" "+w;
+    else{out.push(cur);cur=w;}
+  });
+  if(cur)out.push(cur);
+  return out.length?out:[""];
+}
+function buildRawBtReceipt(t,size){
+  const width=size==="80"?48:32;
+  const parts=[];
+  parts.push(escCmd(0x1b,0x40)); // initialize
+  parts.push(escposBytes("\x1b\x61\x01"));
+  parts.push(escposBytes("\x1b\x45\x01"));
+  parts.push(escposBytes("\x1d\x21\x11"));
+  parts.push(textBytes(fitText(state.settings.name,width)+"\n"));
+  parts.push(escposBytes("\x1d\x21\x00\x1b\x45\x00"));
+  parts.push(textBytes("DIGITAL PRINT\n"));
+  if(state.settings.address) parts.push(textBytes(fitText(state.settings.address,width)+"\n"));
+  if(state.settings.phone) parts.push(textBytes("Telp. "+fitText(state.settings.phone,width-6)+"\n"));
+  parts.push(textBytes(line("=",width)));
+  parts.push(escposBytes("\x1b\x61\x00"));
+  parts.push(textBytes(rowLR("INVOICE",t.invoice,width)));
+  parts.push(textBytes(rowLR("TGL",formatDateTime(t.createdAt),width)));
+  parts.push(textBytes(rowLR("PELANGGAN",t.customerName,width)));
+  parts.push(textBytes(line("-",width)));
+  t.items.forEach(item=>{
+    wrapLines(item.name,width).forEach((ln,i)=>{
+      if(i===0) parts.push(textBytes(ln+"\n")); else parts.push(textBytes("  "+ln+"\n"));
+    });
+    parts.push(textBytes(rowLR(`${item.qty} x ${Number(item.price).toLocaleString("id-ID")}`,Number(item.subtotal).toLocaleString("id-ID"),width)));
+  });
+  parts.push(textBytes(line("-",width)));
+  parts.push(textBytes(rowLR("SUBTOTAL",Number(t.subtotal).toLocaleString("id-ID"),width)));
+  parts.push(textBytes(rowLR("DISKON",Number(t.discount).toLocaleString("id-ID"),width)));
+  parts.push(escposBytes("\x1b\x45\x01"));
+  parts.push(textBytes(rowLR("TOTAL",Number(t.total).toLocaleString("id-ID"),width)));
+  parts.push(escposBytes("\x1b\x45\x00"));
+  parts.push(textBytes(line("-",width)));
+  parts.push(textBytes(rowLR("BAYAR",Number(t.paid).toLocaleString("id-ID"),width)));
+  parts.push(textBytes(rowLR("KEMBALI",Number(t.change).toLocaleString("id-ID"),width)));
+  parts.push(textBytes(rowLR("METODE",t.paymentMethod,width)));
+  parts.push(textBytes(line("=",width)));
+  parts.push(escposBytes("\x1b\x61\x01\x1b\x45\x01"));
+  parts.push(textBytes(fitText(state.settings.footer,width)+"\n"));
+  parts.push(escposBytes("\x1b\x45\x00\x1b\x61\x01"));
+  parts.push(textBytes(fitText(state.settings.name,width)+"\n\n\n\n"));
+  return concatBytes(...parts);
+}
+function sendToRawBT(size){
+  if(!currentReceiptTransaction)return;
+  if(!rawBtAndroid()){
+    // RawBT is an Android driver; on PC keep the normal print-dialog path.
+    prepareBrowserPrint(size);
+    showToast("RawBT digunakan di Android. Desktop memakai print dialog.");
+    return;
+  }
+  try{
+    const bytes=buildRawBtReceipt(currentReceiptTransaction,size);
+    const b64=bytesToBase64(bytes);
+    const rawUrl="rawbt:base64,"+b64;
+    // RawBT documents this custom URI scheme for sending raw ESC/POS bytes.
+    window.location.href=rawUrl;
+    showToast("Mengirim struk ke RawBT...");
+  }catch(err){
+    console.error(err);
+    showToast("Gagal menyiapkan data RawBT.");
+  }
+}
+function prepareBrowserPrint(size){
   if(!currentReceiptTransaction)return;
   const area=document.getElementById("printArea");
   area.innerHTML=receiptHTML(currentReceiptTransaction);
   document.body.classList.remove("print-58","print-80");
   document.body.classList.add(size==="80"?"print-80":"print-58");
-  // Print dialog menggunakan browser sehingga printer USB yang dikenali OS dapat dipilih.
   setTimeout(()=>window.print(),100);
+}
+function preparePrint(size){
+  sendToRawBT(size);
 }
 
 /* =========================
