@@ -1034,23 +1034,53 @@ function buildRawBtReceipt(t,size){
   parts.push(textBytes(fitText(state.settings.name,width)+"\n\n\n\n"));
   return concatBytes(...parts);
 }
+let rawBtPrintBusy=false;
+let rawBtLastJob="";
+
 function sendToRawBT(size){
-  if(!currentReceiptTransaction)return;
-  if(!rawBtAndroid()){
-    // RawBT is an Android driver; on PC keep the normal print-dialog path.
-    prepareBrowserPrint(size);
-    showToast("RawBT digunakan di Android. Desktop memakai print dialog.");
+  if(!currentReceiptTransaction) return;
+
+  // Cegah satu klik menghasilkan lebih dari satu job.
+  if(rawBtPrintBusy){
+    showToast("Struk sedang dikirim ke RawBT...");
     return;
   }
+
+  if(!rawBtAndroid()){
+    // RawBT adalah driver Android; di PC tetap gunakan print dialog browser.
+    prepareBrowserPrint(size);
+    showToast("Desktop memakai print dialog.");
+    return;
+  }
+
   try{
     const bytes=buildRawBtReceipt(currentReceiptTransaction,size);
     const b64=bytesToBase64(bytes);
-    const rawUrl="rawbt:base64,"+b64;
-    // RawBT documents this custom URI scheme for sending raw ESC/POS bytes.
-    window.location.href=rawUrl;
+    const jobId=(currentReceiptTransaction.id||currentReceiptTransaction.invoice||Date.now())+"-"+size;
+
+    // Jangan kirim job identik dua kali secara beruntun.
+    if(rawBtLastJob===jobId){
+      showToast("Struk ini sudah dikirim ke RawBT.");
+      return;
+    }
+
+    rawBtPrintBusy=true;
+    rawBtLastJob=jobId;
+
+    // Gunakan explicit Android Intent ke paket RawBT.
+    // Ini mencegah browser memperlakukan rawbt: sebagai navigasi halaman
+    // yang dapat dipanggil kembali ketika RawBT selesai.
+    const intentUrl="intent:base64,"+b64+
+      "#Intent;scheme=rawbt;package=ru.a402d.rawbtprinter;end;";
+
+    window.location.href=intentUrl;
     showToast("Mengirim struk ke RawBT...");
+
+    // Kunci hanya sementara agar tombol tidak bisa membuat job ganda.
+    setTimeout(()=>{ rawBtPrintBusy=false; },5000);
   }catch(err){
     console.error(err);
+    rawBtPrintBusy=false;
     showToast("Gagal menyiapkan data RawBT.");
   }
 }
